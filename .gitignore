@@ -5,3 +5,6 @@ dist/
 .playwright-mcp/
 windows/target/
 linux/target/
+linux/packaging/pkg/
+linux/packaging/src/
+linux/packaging/*.pkg.tar.zst
