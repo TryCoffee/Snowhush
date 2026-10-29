@@ -10,6 +10,7 @@ use wayland_client::Proxy;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_egl::WlEglSurface;
 
+use snowhush_core::geometry::V2;
 use snowhush_core::simulation::{COLUMN_WIDTH, SnowSimulation, Sprite};
 
 const SPRITE_VERTEX: &str = include_str!("shaders/sprite.vert");
@@ -19,6 +20,27 @@ const PILE_FRAGMENT: &str = include_str!("shaders/pile.frag");
 /// The height texture's width; the pile shader wraps its index at the same width.
 const ROW: usize = 4096;
 const OCCLUDERS: usize = 16;
+
+/// The snow on a window whose snow belongs to a neighbouring display, drawn here where the window reaches
+/// over: its surface and bed, as `SnowSimulation::write_window` writes them, placed in this display's coordinates.
+pub struct Guest {
+    pub heights: Vec<f32>,
+    pub count: usize,
+    pub origin: V2,
+    pub top: f32,
+    pub bottom: f32,
+    pub occluders: Vec<[f32; 4]>,
+}
+
+/// A pile to draw: where its columns start in the height texture, and where it lies.
+struct Pile<'a> {
+    offset: usize,
+    count: usize,
+    origin: V2,
+    top: f32,
+    bottom: f32,
+    occluders: &'a [[f32; 4]],
+}
 
 /// The light the snow is drawn in.
 #[derive(Clone, Copy)]
@@ -205,16 +227,35 @@ impl Gpu {
         simulation: &SnowSimulation,
         ambient: Ambient,
         panel: Option<[f32; 4]>,
+        guests: &[Guest],
         time: f32,
     ) -> Result<(), String> {
         self.egl.make_current(self.display, Some(surface.surface), Some(surface.surface), Some(self.context)).map_err(|error| error.to_string())?;
         let sprite_count = simulation.sprite_count();
         self.sprites.resize(sprite_count, Sprite::default());
         let sprites = simulation.write_sprites(&mut self.sprites);
-        let columns = simulation.column_count();
+        let own = simulation.column_count();
+        let columns = own + guests.iter().map(|guest| guest.heights.len()).sum::<usize>();
         let rows = columns.div_ceil(ROW).max(1);
         self.columns.resize(rows * ROW, 0.0);
-        let piles = simulation.write_layers(&mut self.columns[..columns]);
+        let layers = simulation.write_layers(&mut self.columns[..own]);
+        let mut piles: Vec<Pile> = layers
+            .iter()
+            .map(|layer| Pile {
+                offset: layer.offset,
+                count: layer.count,
+                origin: layer.origin,
+                top: layer.top,
+                bottom: layer.bottom,
+                occluders: layer.occluders,
+            })
+            .collect();
+        let mut offset = own;
+        for guest in guests {
+            self.columns[offset..offset + guest.heights.len()].copy_from_slice(&guest.heights);
+            piles.push(Pile { offset, count: guest.count, origin: guest.origin, top: guest.top, bottom: guest.bottom, occluders: &guest.occluders });
+            offset += guest.heights.len();
+        }
 
         let gl = &self.gl;
         let view = [simulation.width(), simulation.height()];

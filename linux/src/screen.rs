@@ -14,7 +14,7 @@ use snowhush_core::simulation::{Pace, SnowSimulation, WindowId, WindowSurface};
 
 use crate::light::{self, Backdrop, Shade};
 use crate::log;
-use crate::render::{Ambient, Gpu, Surface};
+use crate::render::{Ambient, Gpu, Guest, Surface};
 use crate::snow::App;
 use crate::source::Report;
 use crate::windows::{self, Area, Shelf};
@@ -53,6 +53,9 @@ pub struct Screen {
     windows_seen: u64,
     windows_changed_at: Instant,
     covered: bool,
+    /// What the last frame drew of windows' snow that belongs to a neighbouring display, summed up, to tell
+    /// whether it changed.
+    guests_drawn: f32,
     /// When the frame now waiting for the compositor was drawn.
     shown_pending: Option<Instant>,
     backdrop: Option<Backdrop>,
@@ -101,6 +104,7 @@ impl Screen {
             windows_seen: 0,
             windows_changed_at: Instant::now(),
             covered: false,
+            guests_drawn: 0.0,
             shown_pending: None,
             backdrop: None,
             shadow_tint: [0.0; 4],
@@ -164,13 +168,14 @@ impl Screen {
     }
 
     /// The overlay's place on the shared desktop: where the margins put it, as big as the compositor made it.
-    fn area(&self) -> Area {
+    pub fn area(&self) -> Area {
         Area { x: self.bounds.x + self.margins.3 as f64, y: self.bounds.y + self.margins.0 as f64, w: self.size.0 as f64, h: self.size.1 as f64 }
     }
 
     /// Steps the snow and draws it if anything visible changed; returns whether it drew.
     /// `report` is KWin's latest, its generation and whether a window is being dragged; the windows in it
-    /// only collect snow with `snow_on_windows`, the panel always.
+    /// only collect snow with `snow_on_windows`, the panel always. `guests` is the snow of windows that reach
+    /// over from a neighbouring display, drawn as they move with `guests_moving`.
     #[allow(clippy::too_many_arguments)]
     pub fn frame(
         &mut self,
@@ -183,18 +188,24 @@ impl Screen {
         cursor: (f32, f32),
         report: Option<(&Report, u64, bool)>,
         snow_on_windows: bool,
+        guests: &[Guest],
+        guests_moving: bool,
     ) -> Result<bool, String> {
         let dt = self.last_step.map_or(1.0 / 60.0, |last| (now - last).as_secs_f32().min(0.05));
         self.last_step = Some(now);
         if let Some((report, generation, moving)) = report {
             self.follow(report, generation, moving, snow_on_windows, now);
         }
-        let changed = self.simulation.step(dt, self.pointer(cursor));
+        // A neighbour's snow changes with the neighbour's steps, and once gone needs one frame to clear.
+        let guests_drawn: f32 = guests.iter().map(|guest| guest.origin.x + 3.0 * guest.origin.y + guest.heights.iter().sum::<f32>()).sum();
+        let changed = self.simulation.step(dt, self.pointer(cursor)) || guests_drawn != self.guests_drawn;
+        self.guests_drawn = guests_drawn;
 
         let fastest = if budget == PowerBudget::Full { self.interactive_rate } else { self.interactive_rate.min(60) };
         // 24 only where it divides the display's rate evenly; elsewhere it would judder.
         let calm = if budget == PowerBudget::Saver && self.interactive_rate % 24 == 0 { 24 } else { 30 };
         let rate = match self.simulation.pace() {
+            _ if guests_moving && !guests.is_empty() => fastest,
             Pace::Calm => calm,
             Pace::Lively => fastest.min(60),
             Pace::Interactive => fastest,
@@ -222,7 +233,7 @@ impl Screen {
             let r = windows::local_rect(&shelf.rect, &self.area());
             [r.min_x(), r.min_y(), r.max_x(), r.max_y() - shelf.radius]
         });
-        gpu.draw(surface, &self.simulation, Ambient { shadow_tint: self.shadow_tint, ..ambient }, panel, time)?;
+        gpu.draw(surface, &self.simulation, Ambient { shadow_tint: self.shadow_tint, ..ambient }, panel, guests, time)?;
         Ok(true)
     }
 
@@ -251,9 +262,9 @@ impl Screen {
         self.windows_seen = generation;
         let area = self.area();
         let surfaces = if snow_on_windows {
-            windows::surfaces(report, &area, self.shelf.as_ref())
+            windows::surfaces(report, &area, self.shelf.as_ref(), &self.name)
         } else {
-            windows::surfaces(&Report::default(), &area, self.shelf.as_ref())
+            windows::surfaces(&Report::default(), &area, self.shelf.as_ref(), &self.name)
         };
         if surfaces == self.surfaces {
             return;
@@ -276,7 +287,7 @@ impl Screen {
 
     /// Lets the snow on windows fall, keeping what lies on the panel.
     pub fn drop_window_snow(&mut self) {
-        let surfaces = windows::surfaces(&Report::default(), &self.area(), self.shelf.as_ref());
+        let surfaces = windows::surfaces(&Report::default(), &self.area(), self.shelf.as_ref(), &self.name);
         self.simulation.update_windows(&surfaces, 0.1, &HashSet::new(), &HashSet::new(), false);
         self.surfaces = surfaces;
         self.windows_seen = 0;

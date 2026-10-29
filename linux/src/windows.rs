@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use snowhush_core::geometry::Rect;
 use snowhush_core::simulation::{WindowId, WindowSurface};
 
-use crate::source::{Display, Report};
+use crate::source::{Display, Report, Window};
 
 /// Breeze and its kin round a window's top corners by a few pixels; the exact radius belongs to the
 /// decoration theme and isn't reported, so this is a close guess. Maximized windows stay square.
@@ -86,9 +86,29 @@ pub fn window_id(id: &str) -> WindowId {
     hasher.finish() as WindowId
 }
 
-/// The windows on one display that snow can settle on, in its overlay coordinates: y up from the bottom of
-/// `area`, which the overlay covers one logical pixel to one. The shelf comes first: the panel is in front.
-pub fn surfaces(report: &Report, area: &Area, shelf: Option<&Shelf>) -> Vec<WindowSurface> {
+/// The display whose snow a window's top edge belongs to: the one holding most of it. Each display has a
+/// simulation of its own, and a window's snow lies in one of them, handed over as the window is dragged across.
+pub fn owner<'a>(report: &'a Report, window: &Window) -> Option<&'a str> {
+    let share = |display: &Display| {
+        let area = Area::work(display);
+        if window.y < area.y || window.y >= area.bottom() {
+            return 0.0;
+        }
+        ((window.x + window.w).min(area.right()) - window.x.max(area.x)).max(0.0)
+    };
+    report
+        .screens
+        .iter()
+        .map(|display| (display, share(display)))
+        .filter(|(_, share)| *share > 0.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(display, _)| display.name.as_str())
+}
+
+/// The windows on the display named `display` that snow can settle on, in its overlay coordinates: y up from
+/// the bottom of `area`, which the overlay covers one logical pixel to one. Windows whose snow belongs to
+/// another display only hide snow here. The shelf comes first: the panel is in front.
+pub fn surfaces(report: &Report, area: &Area, shelf: Option<&Shelf>, display: &str) -> Vec<WindowSurface> {
     let (width, height) = (area.w as f32, area.h as f32);
     let mut blockers: Vec<Rect> = Vec::new();
     let mut surfaces = Vec::new();
@@ -110,7 +130,8 @@ pub fn surfaces(report: &Report, area: &Area, shelf: Option<&Shelf>) -> Vec<Wind
         let room_above = (window.y - area.y) as f32 >= 6.0 && frame.max_y() < height;
         let on_screen = frame.max_x() > 0.0 && frame.min_x() < width && frame.max_y() > 0.0;
         let fills_screen = frame.width * frame.height >= width * height * 0.9;
-        if room_above && on_screen && !fills_screen && window.solid && frame.width >= 80.0 && frame.height >= 40.0 {
+        let here = owner(report, window).is_none_or(|owner| owner == display);
+        if here && room_above && on_screen && !fills_screen && window.solid && frame.width >= 80.0 && frame.height >= 40.0 {
             let rounded = window.decorated && !window.maximized;
             let radius = window.radius.unwrap_or(if rounded { CORNER_RADIUS } else { 0.0 }).min(frame.width / 2.0).min(frame.height / 2.0);
             let region = Rect { x: frame.x, y: frame.max_y() - radius, width: frame.width, height: 40.0 + radius };

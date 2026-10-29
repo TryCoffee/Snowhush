@@ -226,6 +226,51 @@ fn a_window_slid_past_the_screen_edge_leaves_its_snow_heaped_against_it() {
     }
 }
 
+#[test]
+fn a_window_dragged_to_the_next_display_takes_its_snow_along() {
+    // Two displays side by side, each with a simulation of its own; the window belongs to the one that
+    // holds most of its top edge.
+    let (width, window) = (1280.0, 500.0);
+    let none = HashSet::new();
+    let mut left = SnowSimulation::new(width, 800.0, Snowfall::Heavy);
+    let mut right = SnowSimulation::new(width, 800.0, Snowfall::Off);
+    left.thaws = false;
+    right.thaws = false;
+    left.walls = (true, false);
+    right.walls = (false, true);
+    left.update_windows(&[surface(4, 300.0, 600.0, window)], 0.2, &none, &none, false);
+    run(&mut left, 90.0, AWAY);
+    left.set_snowfall(Snowfall::Off);
+    run(&mut left, 10.0, AWAY);
+    let resting = ledge(&left);
+
+    let mut on_right = false;
+    for step in 0..=240 {
+        // Eased in and out, as a hand drags, from x = 300 on the left display to x = 1500.
+        let t = step as f32 / 240.0;
+        let x = 300.0 + 1200.0 * t * t * (3.0 - 2.0 * t);
+        if !on_right && x + window / 2.0 > width {
+            on_right = true;
+            let snow = left.take_window(4).expect("snow on the window");
+            right.adopt_window(4, snow, V2::new(-width, 0.0));
+        }
+        if on_right {
+            right.update_windows(&[surface(4, x - width, 600.0, window)], DT, &none, &none, false);
+            left.update_windows(&[], DT, &none, &none, false);
+        } else {
+            left.update_windows(&[surface(4, x, 600.0, window)], DT, &none, &none, false);
+        }
+        left.step(DT, AWAY);
+        right.step(DT, AWAY);
+    }
+    run(&mut right, 3.0, AWAY);
+    let arrived = ledge(&right);
+    assert!(arrived > resting * 0.5, "resting {resting}, arrived {arrived}");
+    assert_eq!(ledge(&left), 0.0, "snow left behind on the first display");
+    assert_finite(&left);
+    assert_finite(&right);
+}
+
 fn shake(simulation: &mut SnowSimulation, id: isize) {
     let none = HashSet::new();
     let mut t = 0.0;

@@ -584,6 +584,63 @@ impl SnowSimulation {
         }
     }
 
+    /// Takes the snow off a window that moved to a display with a simulation of its own, so it can lie on
+    /// there instead of falling here. `None` without snow kept for that window.
+    pub fn take_window(&mut self, id: WindowId) -> Option<SnowLayer> {
+        let li = self.ids.iter().skip(1).position(|&other| other == id)? + 1;
+        // Held columns are kept by index, which the removal would shift.
+        for held in self.air.held_layers.drain(..) {
+            if let Some(layer) = self.layers.get_mut(held) {
+                layer.release_support();
+            }
+        }
+        self.ids.remove(li);
+        let ledge = self.layers.remove(li);
+        self.air.windows_changed = true;
+        Some(ledge)
+    }
+
+    /// Puts snow taken from another simulation onto its window here. `shift` takes the other simulation's
+    /// coordinates to these; the snow keeps its motion, so a drag across displays goes on as one.
+    pub fn adopt_window(&mut self, id: WindowId, mut ledge: SnowLayer, shift: V2) {
+        if let Some(li) = self.ids.iter().skip(1).position(|&other| other == id) {
+            self.ids.remove(li + 1);
+            self.layers.remove(li + 1);
+            self.air.held_layers.clear();
+        }
+        self.dormant.remove(&id);
+        self.parking.retain(|entry| entry.0 != id);
+        ledge.origin += shift;
+        ledge.track += shift;
+        ledge.previous_base_y += shift.y;
+        for occluder in &mut ledge.occluders {
+            *occluder = [occluder[0] + shift.x, occluder[1] + shift.y, occluder[2] + shift.x, occluder[3] + shift.y];
+        }
+        self.layers.push(ledge);
+        self.ids.push(id);
+        self.air.windows_changed = true;
+    }
+
+    /// One window's pile, written as `write_layers` writes them all, for drawing it on a neighbouring display
+    /// while the window lies across both. `None` while the window has no snow.
+    pub fn write_window(&self, id: WindowId, buffer: &mut Vec<f32>) -> Option<PileLayer<'_>> {
+        let li = self.ids.iter().skip(1).position(|&other| other == id)? + 1;
+        let layer = &self.layers[li];
+        if layer.top <= 0.05 {
+            return None;
+        }
+        buffer.resize(2 * layer.count(), 0.0);
+        layer.write_smoothed(buffer);
+        Some(PileLayer {
+            offset: 0,
+            count: layer.count(),
+            origin: layer.base(),
+            top: layer.top,
+            bottom: -layer.bed_depth,
+            occluders: &layer.occluders,
+        })
+    }
+
     fn unpark(&mut self, id: WindowId) -> Option<SnowLayer> {
         let index = self.parking.iter().position(|entry| entry.0 == id)?;
         Some(self.parking.remove(index).1)

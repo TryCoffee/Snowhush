@@ -2,6 +2,7 @@
 //! and what pauses the snow. Everything runs on the main thread around one event loop; the tray and the
 //! KWin reports come in from threads of their own.
 
+use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -18,14 +19,15 @@ use wayland_client::protocol::{wl_output, wl_surface};
 use wayland_client::{Connection, QueueHandle};
 use zbus::blocking::Connection as Bus;
 
-use snowhush_core::simulation::{SnowSimulation, Snowfall};
+use snowhush_core::geometry::V2;
+use snowhush_core::simulation::{SnowSimulation, Snowfall, WindowId};
 
 use crate::chores;
 use crate::kwin;
 use crate::light::{Shade, daylight};
 use crate::log;
 use crate::prefs::Settings;
-use crate::render::{Ambient, Gpu};
+use crate::render::{Ambient, Gpu, Guest};
 use crate::screen::{PowerBudget, Screen};
 use crate::source::{Report, Shared, Source};
 use crate::tray::Tray;
@@ -64,6 +66,8 @@ pub struct App {
     quit: bool,
     displays_changed_at: Option<Instant>,
     report: (u64, Option<Arc<Report>>),
+    /// The display each window's snow belongs to, by name.
+    owners: HashMap<WindowId, String>,
     budget: PowerBudget,
     light: [f32; 3],
     started: Instant,
@@ -129,6 +133,7 @@ pub fn run() -> Result<(), String> {
         quit: false,
         displays_changed_at: None,
         report: (0, None),
+        owners: HashMap::new(),
         budget: PowerBudget::Full,
         light: daylight(),
         started: now,
@@ -283,6 +288,7 @@ impl App {
             }
             self.report = report;
             self.place_screens();
+            self.hand_over(now);
         }
         // Display changes come in bursts; the layout is read once they settle.
         if let Some(changed_at) = self.displays_changed_at
@@ -314,8 +320,15 @@ impl App {
         let ambient = Ambient { light: self.light, shadow_tint: [0.0; 4] };
         let report = self.report.1.clone();
         let windows = report.as_deref().map(|report| (report, self.report.0, report.moving));
+        let guests: Vec<Vec<Guest>> = (0..self.screens.len())
+            .map(|index| match report.as_deref() {
+                Some(report) if snow_on_windows && self.screens[index].next_due <= now => self.guests(index, report),
+                _ => Vec::new(),
+            })
+            .collect();
+        let moving = report.as_deref().is_some_and(|report| report.moving);
         let mut released = false;
-        for screen in self.screens.iter_mut().filter(|screen| screen.next_due <= now) {
+        for (screen, guests) in self.screens.iter_mut().zip(&guests).filter(|(screen, _)| screen.next_due <= now) {
             let covering = report.as_deref().and_then(|report| windows::covering(report, &screen.bounds));
             if covering.is_some() != screen.covered() {
                 log!("{} {}", screen.name, covering.map_or("uncovered".to_string(), |class| format!("covered by {class}")));
@@ -326,7 +339,7 @@ impl App {
                 continue;
             }
             let began = Instant::now();
-            match screen.frame(&mut self.gpu, &self.qh, now, self.budget, ambient, time, cursor, windows, snow_on_windows) {
+            match screen.frame(&mut self.gpu, &self.qh, now, self.budget, ambient, time, cursor, windows, snow_on_windows, guests, moving) {
                 Ok(drew) => {
                     self.stats.frame(drew, began.elapsed(), screen.simulation.sprite_count());
                     released |= screen.simulation.take_snowfall_released();
@@ -373,6 +386,68 @@ impl App {
             screen.release(&self.gpu);
         }
         self.place_screens();
+    }
+
+    /// Moves a window's snow to the display it now belongs to, as when it is dragged across: each display has
+    /// a simulation of its own, and the window's snow would otherwise fall off the old one's edge and be lost.
+    fn hand_over(&mut self, now: Instant) {
+        let Some(report) = self.report.1.clone() else { return };
+        let mut owners = HashMap::new();
+        for window in &report.windows {
+            let Some(owner) = windows::owner(&report, window) else { continue };
+            let id = windows::window_id(&window.id);
+            if let Some(previous) = self.owners.get(&id).cloned()
+                && previous != owner
+            {
+                self.move_snow(id, &previous, owner, now);
+            }
+            owners.insert(id, owner.to_string());
+        }
+        self.owners = owners;
+    }
+
+    fn move_snow(&mut self, id: WindowId, from: &str, to: &str, now: Instant) {
+        let (Some(a), Some(b)) = (self.screens.iter().position(|s| s.name == from), self.screens.iter().position(|s| s.name == to)) else {
+            return;
+        };
+        let Some(snow) = self.screens[a].simulation.take_window(id) else { return };
+        let (old, new) = (self.screens[a].area(), self.screens[b].area());
+        // Overlay coordinates run right and up from each overlay's bottom left.
+        let shift = V2::new((old.x - new.x) as f32, (new.bottom() - old.bottom()) as f32);
+        self.screens[b].simulation.adopt_window(id, snow, shift);
+        self.screens[a].rewatch();
+        self.screens[b].rewatch();
+        self.screens[b].wake(now);
+        log!("window snow from {from} to {to}");
+    }
+
+    /// The snow on windows that belong to other displays, where they reach over onto display `index`, in its
+    /// coordinates: a window dragged across keeps its drift in one piece instead of ending at the edge.
+    fn guests(&self, index: usize, report: &Report) -> Vec<Guest> {
+        let screen = &self.screens[index];
+        let here = screen.area();
+        let mut guests = Vec::new();
+        for window in &report.windows {
+            let reaches = window.x < here.right() && window.x + window.w > here.x && window.y >= here.y && window.y < here.bottom();
+            let Some(owner) = windows::owner(report, window).filter(|owner| *owner != screen.name) else { continue };
+            let Some(home) = self.screens.iter().find(|other| other.name == owner && !other.covered()) else { continue };
+            if !reaches {
+                continue;
+            }
+            let mut heights = Vec::new();
+            let Some(pile) = home.simulation.write_window(windows::window_id(&window.id), &mut heights) else { continue };
+            let there = home.area();
+            let shift = V2::new((there.x - here.x) as f32, (here.bottom() - there.bottom()) as f32);
+            guests.push(Guest {
+                count: pile.count,
+                origin: pile.origin + shift,
+                top: pile.top,
+                bottom: pile.bottom,
+                occluders: pile.occluders.iter().map(|o| [o[0] + shift.x, o[1] + shift.y, o[2] + shift.x, o[3] + shift.y]).collect(),
+                heights,
+            });
+        }
+        guests
     }
 
     /// Fits each overlay to its display's work area, and tells each simulation where its walls are.
