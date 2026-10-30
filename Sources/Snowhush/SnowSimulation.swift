@@ -166,6 +166,11 @@ final class SnowSimulation {
     private let gustLag: Float = 0.3
     /// Snow a wall scrapes up packs down to this share of its fresh bulk.
     private let packing: Float = 0.6
+    /// A sliding Space drags the air along: the wind it stirs up is this share of its speed, up to `slideWindMax`,
+    /// and dies down over `slideCalm` seconds once the Space stops.
+    private let slideDrag: Float = 0.025
+    private let slideWindMax: Float = 160
+    private let slideCalm: Float = 0.35
 
     private let ground: SnowLayer
     private var ledges: [CGWindowID: SnowLayer] = [:]
@@ -195,6 +200,7 @@ final class SnowSimulation {
     private var nextShift: Double = 0
     /// A gust clearing the snow: its front sweeps across from the windward side, lifting the drifts behind it.
     private var gust: (start: Double, direction: Float, calm: Bool)?
+    private var slideWind: Float = 0
 
     init(width: Float, height: Float, snowfall: Snowfall) {
         self.width = width
@@ -234,6 +240,7 @@ final class SnowSimulation {
         heightsChanged = false
 
         vary(dt: dt)
+        slideWind = abs(slideWind) < 1 ? 0 : slideWind * exp(-dt / slideCalm)
         expireParking()
         for ledge in ledgeList { carry(ledge, dt: dt) }
         trackCursor(point, dt: dt)
@@ -252,7 +259,7 @@ final class SnowSimulation {
         // Only a cursor that actually displaces snow needs the full rate; one passing near it or resting in it changes nothing.
         let pushed = clock - lastWindowMotion < 0.6 || clock - lastCursorPush < 0.3 || gust != nil
         // The steady trickle off window corners is a few tiny grains at a time; they read fine at the calm rate.
-        let flying = grains.count > 24 || clock < scatteredUntil
+        let flying = grains.count > 24 || clock < scatteredUntil || abs(slideWind) > 20
         if pushed {
             pace = .interactive
         } else if flying {
@@ -326,6 +333,13 @@ final class SnowSimulation {
         spaceChangedAt = clock
         for entry in parking { dormant[entry.id] = entry.ledge }
         parking.removeAll()
+    }
+
+    /// A Space slid past at `velocity` points a second, negative to the left: the air it drags along blows the
+    /// falling snow that way for a moment.
+    func spaceSlid(velocity: Float) {
+        let wind = min(max(velocity * slideDrag, -slideWindMax), slideWindMax)
+        if abs(wind) > abs(slideWind) { slideWind = wind }
     }
 
     func updateWindows(_ surfaces: [WindowSurface], interval: Float, parked: Set<CGWindowID> = [], elsewhere: Set<CGWindowID> = [], sliding: Bool = false) {
@@ -898,8 +912,9 @@ final class SnowSimulation {
     }
 
     private func advanceFlakes(dt: Float) {
-        let wind = breeze()
-        let follow = min(1, dt * 1.2)
+        let wind = breeze() + slideWind
+        // A Space's wind is short: the flakes take it up faster than the slow breeze, or it would be gone first.
+        let follow = min(1, dt * (1.2 + abs(slideWind) * 0.03))
         let settle = min(1, dt * 1.6)
         let wakeRadius: Float = 80
         var wakeVelocity = cursorVelocity
@@ -1101,7 +1116,7 @@ final class SnowSimulation {
     }
 
     private func windSpeed() -> Float {
-        breeze() + gustSpeed()
+        breeze() + gustSpeed() + slideWind
     }
 
     private func breeze() -> Float {

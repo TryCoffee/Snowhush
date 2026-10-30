@@ -11,6 +11,9 @@ struct WindowUpdate {
     let elsewhere: Set<CGWindowID>
     /// The whole Space is sliding past, as on a switch between Spaces: windows move without being moved.
     let sliding: Bool
+    /// How fast the sliding Space carried its windows since the previous poll, in points a second, negative to
+    /// the left; zero when it didn't.
+    let slideVelocity: Float
 }
 
 struct WindowSurface: Equatable {
@@ -119,7 +122,8 @@ final class WindowTracker {
         // The Dock stays behind as a full-screen app's Space slides in, and its snow falls.
         if let dock = sinkingDock { elsewhere.remove(dock) }
         let shown = lead == 0 ? surfaces : surfaces.map { $0.isDock || staying.contains($0.id) ? $0 : $0.shifted(by: lead) }
-        return WindowUpdate(surfaces: shown, interval: Float(min(interval, 0.25)), parked: away.parked, elsewhere: elsewhere, sliding: sliding)
+        let slideVelocity = shift.map { Float($0) / Float(max(interval, 1.0 / 120)) } ?? 0
+        return WindowUpdate(surfaces: shown, interval: Float(min(interval, 0.25)), parked: away.parked, elsewhere: elsewhere, sliding: sliding, slideVelocity: slideVelocity)
     }
 
     /// How far each window carried by the sliding Space is from where it rests on its own Space: the window server keeps
