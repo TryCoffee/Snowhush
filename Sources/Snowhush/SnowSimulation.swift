@@ -246,6 +246,7 @@ final class SnowSimulation {
         trackCursor(point, dt: dt)
         for ledge in ledgeList where !ledge.carried { confine(ledge) }
         blow(dt: dt)
+        skim(dt: dt)
         advanceFlakes(dt: dt)
         advanceGrains(dt: dt)
         advanceMotes(dt: dt)
@@ -1210,6 +1211,49 @@ final class SnowSimulation {
                 }
             }
         }
+    }
+
+    /// The wind of a sliding Space skims the drifts, most off the crests that stand above the snow around them:
+    /// a little powder flies a short way downwind and settles again.
+    private func skim(dt: Float) {
+        let share = abs(slideWind) / slideWindMax
+        guard share > 0.1 else { return }
+        for layer in layers {
+            let count = layer.count
+            var dust: Float = 0
+            for i in 0..<count where layer.visible[i] {
+                let height = layer.heights[i]
+                guard height > 1.5 else { continue }
+                let around = (layer.heights[max(i - 12, 0)] + layer.heights[min(i + 12, count - 1)]) / 2
+                let loss = min(height * 0.2, (0.2 + max(0, height - around) * 1.5) * share * dt)
+                layer.set(i, height - loss)
+                heightsChanged = true
+                dust += loss * layer.columnWidth
+                while dust >= 1.5 {
+                    puff(at: SIMD2(layer.centerX(i), layer.surface(i)), area: 1.5)
+                    dust -= 1.5
+                }
+            }
+        }
+    }
+
+    /// A pinch of powder off a crest, thrown downwind by a sliding Space's wind; it lands again where it falls.
+    private func puff(at position: SIMD2<Float>, area: Float) {
+        guard grains.count < maxGrains else { return }
+        grains.append(Grain(
+            position: position + SIMD2(random.range(-1, 1), random.range(-2, 0)),
+            velocity: SIMD2(slideWind * random.range(1.5, 3), random.range(60, 260)),
+            area: area,
+            size: random.range(1.1, 2.4)
+        ))
+        guard random.next() < 0.3, motes.count < maxMotes else { return }
+        motes.append(Mote(
+            position: position,
+            velocity: SIMD2(slideWind * random.range(0.8, 2), random.range(20, 90)),
+            size: random.range(6, 13),
+            alpha: random.range(0.06, 0.12),
+            life: random.range(0.5, 1)
+        ))
     }
 
     /// Where the gust's front is `age` seconds in, coming in from `margin` past the windward edge.
