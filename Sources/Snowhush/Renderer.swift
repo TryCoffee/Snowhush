@@ -14,6 +14,26 @@ struct Uniforms {
     var padding: Float = 0
     var light = SIMD4<Float>(1, 1, 1, 1)
     var shadowTint = SIMD4<Float>(0, 0, 0, 0)
+    var rim = SIMD4<Float>(0, 0, 0, 0)
+    /// The cursor's glow: where it is, how far it reaches and how bright it is.
+    var lantern = SIMD4<Float>(0, 0, 0, 0)
+    /// How far everything is jolted: x and y.
+    var shake = SIMD4<Float>(0, 0, 0, 0)
+    /// The pumpkins' candles: where each burns, how far its light reaches and how bright it is.
+    var pumpkins = (SIMD4<Float>(0, 0, 0, 0), SIMD4<Float>(0, 0, 0, 0), SIMD4<Float>(0, 0, 0, 0))
+}
+
+struct PumpkinUniforms {
+    var anchor: SIMD2<Float>
+    var width: Float
+    var seed: Float
+}
+
+struct SignUniforms {
+    var anchor: SIMD2<Float>
+    var size: SIMD2<Float>
+    var angle: Float
+    var ground: Float
 }
 
 enum RendererError: Error {
@@ -28,14 +48,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     var budget = PowerBudget.full
     /// Where the Dock's snow is drawn; without one it stays in the main overlay.
     var dockOverlay: DockOverlay?
-    var sceneLight: (CFTimeInterval) -> (light: SIMD3<Float>, shadowTint: SIMD4<Float>) = { _ in (SIMD3(repeating: 1), .zero) }
-    private var ambient: (light: SIMD3<Float>, shadowTint: SIMD4<Float>) = (SIMD3(repeating: 1), .zero)
+    var sceneLight: (CFTimeInterval) -> (light: SIMD3<Float>, shadowTint: SIMD4<Float>, rim: SIMD4<Float>, lantern: Float) = { _ in (SIMD3(repeating: 1), .zero, .zero, 0) }
+    private var ambient: (light: SIMD3<Float>, shadowTint: SIMD4<Float>, rim: SIMD4<Float>, lantern: Float) = (SIMD3(repeating: 1), .zero, .zero, 0)
+    private var lanternAt = SIMD2<Float>(-10_000, -10_000)
 
     private let simulation: SnowSimulation
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let spritePipeline: MTLRenderPipelineState
     private let pilePipeline: MTLRenderPipelineState
+    private let signPipeline: MTLRenderPipelineState
+    private let pumpkinPipeline: MTLRenderPipelineState
+    /// The pumpkin's shell and its face, drawn the first time it is needed.
+    private var pumpkinPictures: (shell: MTLTexture, face: MTLTexture)?
+    /// Each caption's sign, drawn the first time a ghost holds it up, and its size in points.
+    private var signPictures: [Int: (texture: MTLTexture, size: SIMD2<Float>)] = [:]
     private let framesInFlight = 3
     private let semaphore: DispatchSemaphore
     private var spriteBuffers: [MTLBuffer] = []
@@ -73,6 +100,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.semaphore = DispatchSemaphore(value: framesInFlight)
         self.spritePipeline = try pipeline("spriteVertex", "spriteFragment")
         self.pilePipeline = try pipeline("pileVertex", "pileFragment")
+        self.signPipeline = try pipeline("signVertex", "signFragment")
+        self.pumpkinPipeline = try pipeline("pumpkinVertex", "pumpkinFragment")
         super.init()
     }
 
@@ -97,7 +126,11 @@ final class Renderer: NSObject, MTKViewDelegate {
             simulation.updateWindows(update.surfaces, interval: update.interval, parked: update.parked, elsewhere: update.elsewhere, sliding: update.sliding)
             if update.slideVelocity != 0 { simulation.spaceSlid(velocity: update.slideVelocity) }
         }
-        let changed = simulation.step(dt: dt, cursor: cursorLocation())
+        let cursor = cursorLocation()
+        let changed = simulation.step(dt: dt, cursor: cursor)
+        // The lantern follows the cursor even over snow that lies still.
+        let lanternMoved = ambient.lantern > 0 && simd_distance(cursor, lanternAt) > 0.5
+        lanternAt = cursor
         let fastest = budget == .full ? interactiveFrameRate : min(60, interactiveFrameRate)
         // 24 only where it divides the display's rate evenly; elsewhere it would judder.
         let calm = budget == .saver && interactiveFrameRate % 24 == 0 ? 24 : 30
@@ -106,10 +139,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         case .lively: min(60, fastest)
         case .interactive: fastest
         }
-        if view.preferredFramesPerSecond != frameRate { view.preferredFramesPerSecond = frameRate }
-        idleFrames = changed ? 0 : idleFrames + 1
+        let pace = lanternMoved ? max(frameRate, min(60, fastest)) : frameRate
+        if view.preferredFramesPerSecond != pace { view.preferredFramesPerSecond = pace }
+        idleFrames = changed || lanternMoved ? 0 : idleFrames + 1
         // A still pile only needs a slow refresh for its glints.
-        guard changed || (simulation.hasSnow && idleFrames % 2 == 0) else { return }
+        guard changed || lanternMoved || ((simulation.hasSnow || !simulation.pumpkins.isEmpty) && idleFrames % 2 == 0) else { return }
 
         semaphore.wait()
         guard let pass = view.currentRenderPassDescriptor,
@@ -149,15 +183,30 @@ final class Renderer: NSObject, MTKViewDelegate {
             time: time,
             columnWidth: simulation.columnWidth,
             light: SIMD4(ambient.light, 1),
-            shadowTint: ambient.shadowTint
+            shadowTint: ambient.shadowTint,
+            rim: ambient.rim,
+            lantern: SIMD4(lowHalf: lanternAt, highHalf: SIMD2(130, ambient.lantern)),
+            shake: SIMD4(lowHalf: simulation.shake, highHalf: .zero)
         )
+        let pumpkins = simulation.pumpkins
+        let candles = pumpkins.prefix(3).map { pumpkin in
+            let height = pumpkin.width * HalloweenPumpkin.aspect
+            let flame = pumpkin.anchor + (HalloweenPumpkin.candle - SIMD2(0.5, 0)) * SIMD2(pumpkin.width, height)
+            return SIMD4(lowHalf: flame, highHalf: SIMD2(pumpkin.width * 1.6, 0.4 + 0.6 * ambient.lantern))
+        }
+        if candles.count > 0 { uniforms.pumpkins.0 = candles[0] }
+        if candles.count > 1 { uniforms.pumpkins.1 = candles[1] }
+        if candles.count > 2 { uniforms.pumpkins.2 = candles[2] }
         let uniformsLength = MemoryLayout<Uniforms>.stride
 
+        drawPumpkins(pumpkins, with: encoder, uniforms: uniforms)
         drawPiles(piles.filter { !$0.isDock }, with: encoder, uniforms: uniforms, heights: heightBuffer)
+        drawSigns(simulation.signs, with: encoder, uniforms: uniforms)
         if sprites > 0 {
             encoder.setRenderPipelineState(spritePipeline)
             encoder.setVertexBuffer(spriteBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: uniformsLength, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: uniformsLength, index: 1)
             encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: sprites)
         }
         encoder.endEncoding()
@@ -196,6 +245,72 @@ final class Renderer: NSObject, MTKViewDelegate {
             encoder.setFragmentBytes(&occluders, length: occluders.count * MemoryLayout<SIMD4<Float>>.stride, index: 2)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
+    }
+
+    private func drawSigns(_ signs: [SignSprite], with encoder: MTLRenderCommandEncoder, uniforms: Uniforms) {
+        guard !signs.isEmpty else { return }
+        var uniforms = uniforms
+        encoder.setRenderPipelineState(signPipeline)
+        for sign in signs {
+            guard let picture = signPicture(sign.caption) else { continue }
+            var shape = SignUniforms(anchor: sign.anchor, size: picture.size, angle: sign.angle, ground: sign.ground)
+            encoder.setVertexBytes(&shape, length: MemoryLayout<SignUniforms>.stride, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&shape, length: MemoryLayout<SignUniforms>.stride, index: 0)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+            encoder.setFragmentTexture(picture.texture, index: 0)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+    }
+
+    /// The pumpkins go down before the snow, so the drift they sit in covers their bottoms.
+    private func drawPumpkins(_ pumpkins: [PumpkinSprite], with encoder: MTLRenderCommandEncoder, uniforms: Uniforms) {
+        guard !pumpkins.isEmpty, let pictures = pumpkinPictures ?? makePumpkinPictures() else { return }
+        var uniforms = uniforms
+        encoder.setRenderPipelineState(pumpkinPipeline)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+        encoder.setFragmentTexture(pictures.shell, index: 0)
+        encoder.setFragmentTexture(pictures.face, index: 1)
+        for pumpkin in pumpkins {
+            var shape = PumpkinUniforms(anchor: pumpkin.anchor, width: pumpkin.width, seed: pumpkin.seed)
+            encoder.setVertexBytes(&shape, length: MemoryLayout<PumpkinUniforms>.stride, index: 0)
+            encoder.setFragmentBytes(&shape, length: MemoryLayout<PumpkinUniforms>.stride, index: 0)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+    }
+
+    /// Drawn large and mipmapped: the pumpkins are shown at a fraction of that, and smaller ones would shimmer.
+    private func makePumpkinPictures() -> (shell: MTLTexture, face: MTLTexture)? {
+        func texture(_ part: HalloweenPumpkin.Part) -> MTLTexture? {
+            guard let context = HalloweenPumpkin.draw(part, scale: 2), let data = context.data else { return nil }
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: context.width, height: context.height, mipmapped: true)
+            descriptor.usage = .shaderRead
+            guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+            texture.replace(region: MTLRegionMake2D(0, 0, context.width, context.height), mipmapLevel: 0, withBytes: data, bytesPerRow: context.bytesPerRow)
+            return texture
+        }
+        guard let shell = texture(.shell), let face = texture(.face),
+              let commandBuffer = queue.makeCommandBuffer(), let blit = commandBuffer.makeBlitCommandEncoder() else { return nil }
+        blit.generateMipmaps(for: shell)
+        blit.generateMipmaps(for: face)
+        blit.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        pumpkinPictures = (shell, face)
+        return pumpkinPictures
+    }
+
+    private func signPicture(_ caption: Int) -> (texture: MTLTexture, size: SIMD2<Float>)? {
+        if let picture = signPictures[caption] { return picture }
+        guard let context = HalloweenSign.draw(HalloweenSign.captions[caption]), let data = context.data else { return nil }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: context.width, height: context.height, mipmapped: false)
+        descriptor.usage = .shaderRead
+        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+        texture.replace(region: MTLRegionMake2D(0, 0, context.width, context.height), mipmapLevel: 0, withBytes: data, bytesPerRow: context.bytesPerRow)
+        let picture = (texture: texture, size: SIMD2(Float(context.width), Float(context.height)) / Float(HalloweenSign.scale))
+        signPictures[caption] = picture
+        return picture
     }
 
     private func reserve(sprites: Int, columns: Int) {
