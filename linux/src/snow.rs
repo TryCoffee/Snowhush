@@ -20,14 +20,14 @@ use wayland_client::{Connection, QueueHandle};
 use zbus::blocking::Connection as Bus;
 
 use snowhush_core::geometry::V2;
-use snowhush_core::simulation::{SnowSimulation, Snowfall, WindowId};
+use snowhush_core::simulation::{Borrowed, SnowSimulation, Snowfall, Stray, WindowId};
 
 use crate::chores;
 use crate::kwin;
 use crate::light::{self, Shade, daylight};
 use crate::log;
 use crate::prefs::Settings;
-use crate::render::{Ambient, Gpu, Guest};
+use crate::render::{Ambient, Gpu};
 use crate::screen::{PowerBudget, Screen};
 use crate::source::{Report, Shared, Source};
 use crate::tray::Tray;
@@ -337,15 +337,11 @@ impl App {
         let ambient = Ambient { light: self.light, shadow_tint: [0.0; 4], night: self.night, lantern: V2::ZERO };
         let report = self.report.1.clone();
         let windows = report.as_deref().map(|report| (report, self.report.0, report.moving));
-        let guests: Vec<Vec<Guest>> = (0..self.screens.len())
-            .map(|index| match report.as_deref() {
-                Some(report) if snow_on_windows && self.screens[index].next_due <= now => self.guests(index, report),
-                _ => Vec::new(),
-            })
-            .collect();
-        let moving = report.as_deref().is_some_and(|report| report.moving);
+        if let Some(report) = report.as_deref() {
+            self.lend(report, snow_on_windows, now);
+        }
         let mut released = false;
-        for (screen, guests) in self.screens.iter_mut().zip(&guests).filter(|(screen, _)| screen.next_due <= now) {
+        for screen in self.screens.iter_mut().filter(|screen| screen.next_due <= now) {
             let covering = report.as_deref().and_then(|report| windows::covering(report, &screen.bounds));
             if covering.is_some() != screen.covered() {
                 log!("{} {}", screen.name, covering.map_or("uncovered".to_string(), |class| format!("covered by {class}")));
@@ -356,7 +352,7 @@ impl App {
                 continue;
             }
             let began = Instant::now();
-            match screen.frame(&mut self.gpu, &self.qh, now, self.budget, ambient, time, cursor, windows, snow_on_windows, guests, moving) {
+            match screen.frame(&mut self.gpu, &self.qh, now, self.budget, ambient, time, cursor, windows, snow_on_windows) {
                 Ok(drew) => {
                     self.stats.frame(drew, began.elapsed(), screen.simulation.sprite_count());
                     released |= screen.simulation.take_snowfall_released();
@@ -367,6 +363,7 @@ impl App {
         if released {
             self.screens.iter_mut().for_each(|screen| screen.simulation.set_snowfall_held(false));
         }
+        self.pass_snow();
         self.stats.report(Instant::now());
         Ok(())
     }
@@ -458,33 +455,73 @@ impl App {
         log!("window snow from {from} to {to}");
     }
 
-    /// The snow on windows that belong to other displays, where they reach over onto display `index`, in its
-    /// coordinates: a window dragged across keeps its drift in one piece instead of ending at the edge.
-    fn guests(&self, index: usize, report: &Report) -> Vec<Guest> {
-        let screen = &self.screens[index];
-        let here = screen.area();
-        let mut guests = Vec::new();
-        for window in &report.windows {
-            let reaches = window.x < here.right() && window.x + window.w > here.x && window.y >= here.y && window.y < here.bottom();
-            let Some(owner) = windows::owner(report, window).filter(|owner| *owner != screen.name) else { continue };
-            let Some(home) = self.screens.iter().find(|other| other.name == owner && !other.covered()) else { continue };
-            if !reaches {
+    /// Gives each display about to draw the snow of windows reaching over it that another display keeps.
+    fn lend(&mut self, report: &Report, snow_on_windows: bool, now: Instant) {
+        for index in 0..self.screens.len() {
+            if self.screens[index].next_due > now {
                 continue;
             }
-            let mut heights = Vec::new();
-            let Some(pile) = home.simulation.write_window(windows::window_id(&window.id), &mut heights) else { continue };
-            let there = home.area();
-            let shift = V2::new((there.x - here.x) as f32, (here.bottom() - there.bottom()) as f32);
-            guests.push(Guest {
-                count: pile.count,
-                origin: pile.origin + shift,
-                top: pile.top,
-                bottom: pile.bottom,
-                occluders: pile.occluders.iter().map(|o| [o[0] + shift.x, o[1] + shift.y, o[2] + shift.x, o[3] + shift.y]).collect(),
-                heights,
-            });
+            let borrowed = if snow_on_windows { self.borrowed(index, report) } else { Vec::new() };
+            self.screens[index].simulation.set_borrowed(borrowed);
         }
-        guests
+    }
+
+    /// The snow of windows kept by other displays, where it reaches over display `index`, in its coordinates: a
+    /// window lying across two displays keeps its drift in one piece instead of ending at the edge.
+    fn borrowed(&self, index: usize, report: &Report) -> Vec<Borrowed> {
+        let screen = &self.screens[index];
+        let here = screen.area();
+        let mut borrowed = Vec::new();
+        for window in &report.windows {
+            let id = windows::window_id(&window.id);
+            let Some(owner) = self.owners.get(&id).filter(|owner| **owner != screen.name) else { continue };
+            // The drift stands above the window's top edge, never as high as this.
+            let near = window.x < here.right() && window.x + window.w > here.x && window.y - 300.0 < here.bottom() && window.y + 20.0 > here.y;
+            let Some(home) = self.screens.iter().find(|other| other.name == *owner).filter(|_| near) else { continue };
+            let Some(lent) = home.simulation.lend(id) else { continue };
+            let there = home.area();
+            let lent = lent.shifted(V2::new((there.x - here.x) as f32, (here.bottom() - there.bottom()) as f32));
+            let [left, bottom, right, top] = lent.bounds();
+            if right > 0.0 && left < here.w as f32 && top > 0.0 && bottom < here.h as f32 {
+                borrowed.push(lent);
+            }
+        }
+        borrowed
+    }
+
+    /// Passes on the snow that went from one display to another this frame: snow that fell on a window's drift
+    /// lent by another display goes to that one, and snow thrown past an edge two displays share goes on falling
+    /// on the other side.
+    fn pass_snow(&mut self) {
+        for index in 0..self.screens.len() {
+            let here = self.screens[index].area();
+            for caught in self.screens[index].simulation.take_caught() {
+                let Some(owner) = self.owners.get(&caught.id) else { continue };
+                let Some(home) = self.screens.iter_mut().find(|other| other.name == *owner) else { continue };
+                let shift = (here.x - home.area().x) as f32;
+                home.simulation.catch(&caught, shift);
+            }
+            let mut passed: Vec<(usize, Vec<Stray>)> = Vec::new();
+            for stray in self.screens[index].simulation.take_strays() {
+                let point = stray.position();
+                let (x, y) = (here.x + point.x as f64, here.bottom() - point.y as f64);
+                let Some(next) = self.screens.iter().enumerate().position(|(other, screen)| {
+                    let there = screen.area();
+                    other != index && !screen.covered() && x >= there.x && x < there.right() && y < there.bottom()
+                }) else {
+                    continue;
+                };
+                match passed.iter_mut().find(|(other, _)| *other == next) {
+                    Some((_, strays)) => strays.push(stray),
+                    None => passed.push((next, vec![stray])),
+                }
+            }
+            for (next, strays) in passed {
+                let there = self.screens[next].area();
+                let shift = V2::new((here.x - there.x) as f32, (there.bottom() - here.bottom()) as f32);
+                self.screens[next].simulation.adopt_strays(strays, shift);
+            }
+        }
     }
 
     /// Fits each overlay to its display's work area, and tells each simulation where its walls are.
@@ -493,7 +530,9 @@ impl App {
         for screen in &mut self.screens {
             let Some(display) = report.screens.iter().find(|display| display.name == screen.name) else { continue };
             screen.place(Area::bounds(display), Area::work(display), windows::shelf(&report, display));
-            screen.simulation.walls = windows::walls(display, &report.screens);
+            let walls = windows::walls(display, &report.screens);
+            screen.simulation.walls = walls;
+            screen.simulation.neighbours = (!walls.0, !walls.1);
         }
     }
 }

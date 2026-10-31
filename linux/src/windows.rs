@@ -105,6 +105,20 @@ pub fn owner<'a>(report: &'a Report, window: &Window) -> Option<&'a str> {
         .map(|(display, _)| display.name.as_str())
 }
 
+/// Whether the window's top edge lies along the top of display `name`, right under another display, where its
+/// snow has room to stand.
+fn below_display(report: &Report, name: &str, window: &Window) -> bool {
+    let Some(display) = report.screens.iter().find(|display| display.name == name) else { return false };
+    let (area, bounds) = (Area::work(display), Area::bounds(display));
+    area.y == bounds.y
+        && window.y >= area.y
+        && window.y < area.y + 6.0
+        && report
+            .screens
+            .iter()
+            .any(|other| other.name != name && other.y + other.h == bounds.y && other.x < window.x + window.w && other.x + other.w > window.x)
+}
+
 /// The windows on the display named `display` that snow can settle on, in its overlay coordinates: y up from
 /// the bottom of `area`, which the overlay covers one logical pixel to one. Windows whose snow belongs to
 /// another display only hide snow here. The shelf comes first: the panel is in front.
@@ -118,16 +132,18 @@ pub fn surfaces(report: &Report, area: &Area, shelf: Option<&Shelf>, display: &s
         blockers.push(frame);
     }
     for window in &report.windows {
-        if window.x + window.w <= area.x || window.x >= area.right() || window.y + window.h <= area.y || window.y >= area.bottom() {
-            continue;
-        }
         let frame = Rect {
             x: (window.x - area.x) as f32,
             y: (area.bottom() - (window.y + window.h)) as f32,
             width: window.w as f32,
             height: window.h as f32,
         };
-        let room_above = (window.y - area.y) as f32 >= 6.0 && frame.max_y() < height;
+        // One on a neighbouring display still hides the snow of a window here reaching over there.
+        if window.x + window.w <= area.x || window.x >= area.right() || window.y + window.h <= area.y || window.y >= area.bottom() {
+            blockers.push(frame);
+            continue;
+        }
+        let room_above = ((window.y - area.y) as f32 >= 6.0 && frame.max_y() < height) || below_display(report, display, window);
         let on_screen = frame.max_x() > 0.0 && frame.min_x() < width && frame.max_y() > 0.0;
         let fills_screen = frame.width * frame.height >= width * height * 0.9;
         let here = owner(report, window).is_none_or(|owner| owner == display);

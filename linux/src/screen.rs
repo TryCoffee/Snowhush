@@ -14,7 +14,7 @@ use snowhush_core::simulation::{Pace, SnowSimulation, WindowId, WindowSurface};
 
 use crate::light::{self, Backdrop, Shade};
 use crate::log;
-use crate::render::{Ambient, Gpu, Guest, LANTERN_REACH, Surface};
+use crate::render::{Ambient, Gpu, LANTERN_REACH, Surface};
 use crate::snow::App;
 use crate::source::Report;
 use crate::windows::{self, Area, Shelf};
@@ -53,9 +53,6 @@ pub struct Screen {
     windows_seen: u64,
     windows_changed_at: Instant,
     covered: bool,
-    /// What the last frame drew of windows' snow that belongs to a neighbouring display, summed up, to tell
-    /// whether it changed.
-    guests_drawn: f32,
     /// When the frame now waiting for the compositor was drawn.
     shown_pending: Option<Instant>,
     backdrop: Option<Backdrop>,
@@ -108,7 +105,6 @@ impl Screen {
             windows_seen: 0,
             windows_changed_at: Instant::now(),
             covered: false,
-            guests_drawn: 0.0,
             shown_pending: None,
             backdrop: None,
             shadow_tint: [0.0; 4],
@@ -181,8 +177,7 @@ impl Screen {
 
     /// Steps the snow and draws it if anything visible changed; returns whether it drew.
     /// `report` is KWin's latest, its generation and whether a window is being dragged; the windows in it
-    /// only collect snow with `snow_on_windows`, the panel always. `guests` is the snow of windows that reach
-    /// over from a neighbouring display, drawn as they move with `guests_moving`.
+    /// only collect snow with `snow_on_windows`, the panel always.
     #[allow(clippy::too_many_arguments)]
     pub fn frame(
         &mut self,
@@ -195,8 +190,6 @@ impl Screen {
         cursor: (f32, f32),
         report: Option<(&Report, u64, bool)>,
         snow_on_windows: bool,
-        guests: &[Guest],
-        guests_moving: bool,
     ) -> Result<bool, String> {
         let dt = self.last_step.map_or(1.0 / 60.0, |last| (now - last).as_secs_f32().min(0.05));
         self.last_step = Some(now);
@@ -206,10 +199,7 @@ impl Screen {
                 self.simulation.space_slid(slide.velocity(now));
             }
         }
-        // A neighbour's snow changes with the neighbour's steps, and once gone needs one frame to clear.
-        let guests_drawn: f32 = guests.iter().map(|guest| guest.origin.x + 3.0 * guest.origin.y + guest.heights.iter().sum::<f32>()).sum();
-        let changed = self.simulation.step(dt, self.pointer(cursor)) || guests_drawn != self.guests_drawn;
-        self.guests_drawn = guests_drawn;
+        let changed = self.simulation.step(dt, self.pointer(cursor));
         // The candle follows the cursor even over snow that lies still.
         let lantern = self.local(cursor.0, cursor.1);
         let lantern_moved = ambient.night > 0.0 && (lantern - self.lantern).length() > 0.5 && (self.lit_by(lantern) || self.lit_by(self.lantern));
@@ -219,7 +209,6 @@ impl Screen {
         // 24 only where it divides the display's rate evenly; elsewhere it would judder.
         let calm = if budget == PowerBudget::Saver && self.interactive_rate % 24 == 0 { 24 } else { 30 };
         let rate = match self.simulation.pace() {
-            _ if guests_moving && !guests.is_empty() => fastest,
             Pace::Calm => calm,
             Pace::Lively => fastest.min(60),
             Pace::Interactive => fastest,
@@ -251,7 +240,7 @@ impl Screen {
             let r = windows::local_rect(&shelf.rect, &self.area());
             [r.min_x(), r.min_y(), r.max_x(), r.max_y() - shelf.radius]
         });
-        gpu.draw(surface, &self.simulation, Ambient { shadow_tint: self.shadow_tint, lantern, ..ambient }, panel, guests, time)?;
+        gpu.draw(surface, &self.simulation, Ambient { shadow_tint: self.shadow_tint, lantern, ..ambient }, panel, time)?;
         self.pumpkins_shown = pumpkins;
         Ok(true)
     }
