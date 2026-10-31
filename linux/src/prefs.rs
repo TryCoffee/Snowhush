@@ -12,6 +12,7 @@ pub struct Settings {
     pub snow_on_windows: bool,
     pub behind_windows: bool,
     pub show_in_screenshots: bool,
+    pub halloween: bool,
 }
 
 impl Settings {
@@ -29,6 +30,7 @@ impl Settings {
             snow_on_windows: read("snowOnWindows").is_none_or(|v| v != 0),
             behind_windows: read("behindWindows").is_some_and(|v| v != 0),
             show_in_screenshots: read("showInScreenshots").is_some_and(|v| v != 0),
+            halloween: read("halloween").is_none_or(|v| v != 0),
         }
     }
 
@@ -36,8 +38,13 @@ impl Settings {
         let Some(folder) = config_dir() else { return };
         let snowfall = Snowfall::ALL.iter().position(|&s| s == self.snowfall).unwrap_or(2);
         let text = format!(
-            "snowfall={snowfall}\naccumulate={}\nmeltSnow={}\nsnowOnWindows={}\nbehindWindows={}\nshowInScreenshots={}\n",
-            self.accumulate as u32, self.melt as u32, self.snow_on_windows as u32, self.behind_windows as u32, self.show_in_screenshots as u32
+            "snowfall={snowfall}\naccumulate={}\nmeltSnow={}\nsnowOnWindows={}\nbehindWindows={}\nshowInScreenshots={}\nhalloween={}\n",
+            self.accumulate as u32,
+            self.melt as u32,
+            self.snow_on_windows as u32,
+            self.behind_windows as u32,
+            self.show_in_screenshots as u32,
+            self.halloween as u32
         );
         let _ = std::fs::create_dir_all(&folder);
         let _ = std::fs::write(folder.join("settings"), text);
@@ -72,17 +79,36 @@ pub fn set_opens_at_login(on: bool) -> std::io::Result<()> {
 
 /// KDE's animation speed: zero, "Instant", means the person prefers less motion.
 pub fn animations_enabled() -> bool {
-    let Some(text) = config_home().and_then(|folder| std::fs::read_to_string(folder.join("kdeglobals")).ok()) else { return true };
-    let mut in_kde = false;
+    animation_factor() > 0.0
+}
+
+/// How much longer than usual KDE's animations take: zero for "Instant", larger when slower.
+pub fn animation_factor() -> f32 {
+    kde_setting("kdeglobals", "KDE", "AnimationDurationFactor").and_then(|value| value.parse::<f32>().ok()).map_or(1.0, |factor| factor.max(0.0))
+}
+
+/// Whether KWin slides the desktops past on a switch, as it does unless that effect is turned off.
+pub fn slide_enabled() -> bool {
+    kde_setting("kwinrc", "Plugins", "slideEnabled").is_none_or(|value| value != "false")
+}
+
+/// A setting from one of KDE's config files.
+fn kde_setting(file: &str, group: &str, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_home()?.join(file)).ok()?;
+    let header = format!("[{group}]");
+    let mut in_group = false;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            in_kde = line == "[KDE]";
-        } else if in_kde && let Some(("AnimationDurationFactor", value)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
-            return value.parse::<f32>().map_or(true, |factor| factor > 0.0);
+            in_group = line == header;
+        } else if in_group
+            && let Some((name, value)) = line.split_once('=')
+            && name.trim() == key
+        {
+            return Some(value.trim().to_string());
         }
     }
-    true
+    None
 }
 
 fn config_home() -> Option<PathBuf> {

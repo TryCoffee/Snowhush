@@ -12,6 +12,13 @@ final class ScreenSnow {
     private let tracker = WindowTracker()
     private let light = SceneLight()
     private(set) var screen: NSScreen
+    var halloween = false {
+        didSet {
+            light.halloween = halloween
+            light.invalidate()
+            simulation.halloween = halloween
+        }
+    }
 
     init?(screen: NSScreen, device: MTLDevice, snowOnWindows: @escaping () -> Bool) {
         guard let displayID = screen.displayID else { return nil }
@@ -46,11 +53,14 @@ final class ScreenSnow {
             return SIMD2(Float(mouse.x - window.frame.minX), Float(mouse.y - window.frame.minY))
         }
         renderer.windowSurfaces = { [unowned self] now in
-            snowOnWindows() && !window.behindWindows ? tracker.poll(now: now, eager: NSEvent.pressedMouseButtons != 0) : nil
+            guard snowOnWindows() && !window.behindWindows else { return nil }
+            let update = tracker.poll(now: now, eager: NSEvent.pressedMouseButtons != 0)
+            simulation.windowFrames = tracker.covers.map { SIMD4(Float($0.minX), Float($0.minY), Float($0.maxX), Float($0.maxY)) }
+            return update
         }
         renderer.sceneLight = { [unowned self] now in
             light.update(screen: self.screen, now: now)
-            return (light.light, light.shadowTint)
+            return (light.light, light.shadowTint, light.rim, light.lantern)
         }
         renderer.interactiveFrameRate = Self.interactiveFrameRate(of: screen)
         measure()
@@ -87,6 +97,7 @@ final class ScreenSnow {
 
     func dropWindowSnow() {
         simulation.updateWindows([], interval: 0.1)
+        simulation.windowFrames = []
         tracker.reset()
     }
 

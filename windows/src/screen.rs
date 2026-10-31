@@ -20,11 +20,13 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Error, PCWSTR, Result, w};
 
 use snowhush_core::geometry::V2;
+use snowhush_core::halloween::moonlit;
 use snowhush_core::simulation::{Pace, SnowSimulation, WindowId, WindowSurface};
 
 use crate::desktop::DesktopLayer;
-use crate::light::{Backdrop, Wallpapers};
+use crate::light::{Backdrop, Sky, Wallpapers};
 use crate::log;
+use crate::prefs::Settings;
 use crate::render::{Ambient, Gpu, Surface};
 use crate::tracker::{COVER_ONLY, Tracker, class_name, cloaked, process_name};
 
@@ -52,7 +54,8 @@ pub enum PowerBudget {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Monitor {
     pub name: String,
-    /// The work area in physical pixels: the taskbar is the ground the snow settles on, so it is left out.
+    /// The work area in physical pixels: the taskbar is the ground the snow settles on, so it is left out,
+    /// unless the snow goes behind the taskbar, which it then reaches down past to the bottom of the display.
     pub rect: RECT,
     /// The whole display in physical pixels.
     pub bounds: RECT,
@@ -60,7 +63,7 @@ pub struct Monitor {
     pub refresh: u32,
 }
 
-pub fn monitors() -> Vec<Monitor> {
+pub fn monitors(behind_taskbar: bool) -> Vec<Monitor> {
     unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, list: LPARAM) -> BOOL {
         let list = unsafe { &mut *(list.0 as *mut Vec<HMONITOR>) };
         list.push(monitor);
@@ -87,9 +90,10 @@ pub fn monitors() -> Vec<Monitor> {
                 60
             };
             let length = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            let (work, bounds) = (info.monitorInfo.rcWork, info.monitorInfo.rcMonitor);
             Some(Monitor {
                 name: String::from_utf16_lossy(&info.szDevice[..length]),
-                rect: info.monitorInfo.rcWork,
+                rect: if behind_taskbar { RECT { bottom: bounds.bottom, ..work } } else { work },
                 bounds: info.monitorInfo.rcMonitor,
                 dpi,
                 refresh,
@@ -220,6 +224,9 @@ pub struct Screen {
     backdrop: Option<Backdrop>,
     shadow_tint: [f32; 4],
     layer: Option<DesktopLayer>,
+    behind_taskbar: bool,
+    /// Where the cursor's candlelight was last drawn.
+    lantern_at: V2,
 }
 
 impl Screen {
@@ -229,11 +236,11 @@ impl Screen {
         gpu: &Gpu,
         monitor: Monitor,
         simulation: SnowSimulation,
-        shown_in_screenshots: bool,
+        settings: &Settings,
         layer: Option<DesktopLayer>,
     ) -> std::result::Result<Screen, (Error, SnowSimulation)> {
         let size = dip_size(&monitor);
-        let (overlay, surface) = match Self::overlay(gpu, &monitor, size, shown_in_screenshots, layer) {
+        let (overlay, surface) = match Self::overlay(gpu, &monitor, size, settings.show_in_screenshots, layer) {
             Ok(parts) => parts,
             Err(error) => return Err((error, simulation)),
         };
@@ -254,6 +261,8 @@ impl Screen {
             backdrop: None,
             shadow_tint: [0.0; 4],
             layer,
+            behind_taskbar: settings.behind_taskbar,
+            lantern_at: V2::new(-10_000.0, -10_000.0),
         })
     }
 
@@ -276,22 +285,17 @@ impl Screen {
 
     /// Steps the snow and draws it if anything visible changed; returns whether it drew.
     /// `windows` is left out while snow on windows is off.
-    pub fn frame(
-        &mut self,
-        gpu: &Gpu,
-        clock: &Clock,
-        now: i64,
-        budget: PowerBudget,
-        light: [f32; 3],
-        time: f32,
-        windows: Option<&Tracker>,
-    ) -> Result<bool> {
+    pub fn frame(&mut self, gpu: &Gpu, clock: &Clock, now: i64, budget: PowerBudget, sky: Sky, time: f32, windows: Option<&Tracker>) -> Result<bool> {
         let dt = if self.last_step == 0 { 1.0 / 60.0 } else { clock.seconds(now - self.last_step).min(0.05) as f32 };
         self.last_step = now;
         if let Some(tracker) = windows {
             self.follow(tracker, clock, now);
         }
-        let changed = self.simulation.step(dt, self.cursor());
+        let cursor = self.cursor();
+        let changed = self.simulation.step(dt, cursor);
+        // The lantern follows the cursor even over snow that lies still.
+        let lantern_moved = sky.night > 0.0 && (cursor - self.lantern_at).length() > 0.5;
+        self.lantern_at = cursor;
 
         let fastest = if budget == PowerBudget::Full { self.interactive_rate } else { self.interactive_rate.min(60) };
         // 24 only where it divides the display's rate evenly; elsewhere it would judder.
@@ -301,13 +305,17 @@ impl Screen {
             Pace::Lively => fastest.min(60),
             Pace::Interactive => fastest,
         };
+        let rate = if lantern_moved { rate.max(fastest.min(60)) } else { rate };
         self.next_due = clock.schedule(now, rate);
-        self.idle_frames = if changed { 0 } else { self.idle_frames + 1 };
+        self.idle_frames = if changed || lantern_moved { 0 } else { self.idle_frames + 1 };
         // A still pile only needs a slow refresh for its glints.
-        if !(changed || (self.simulation.has_snow() && self.idle_frames % 2 == 0)) {
+        if !(changed || lantern_moved || ((self.simulation.has_snow() || !self.simulation.pumpkins().is_empty()) && self.idle_frames % 2 == 0)) {
             return Ok(false);
         }
-        self.surface.draw(gpu, &self.simulation, Ambient { light, shadow_tint: self.shadow_tint }, time)?;
+        // Halloween night: cold moonlight, violet shadows and a candle's glow along the drifts' edges.
+        let (light, shadow_tint) = moonlit(sky.daylight, self.shadow_tint, sky.night);
+        let ambient = Ambient { light, shadow_tint, rim: [1.0, 0.56, 0.2, 0.3 * sky.night], lantern: (cursor, sky.night) };
+        self.surface.draw(gpu, &self.simulation, ambient, time)?;
         Ok(true)
     }
 
@@ -317,6 +325,7 @@ impl Screen {
             return;
         }
         self.windows_seen = tracker.generation;
+        self.simulation.covers = tracker.covers(&self.monitor.rect, self.size);
         let surfaces = tracker.surfaces(&self.monitor.rect, self.size);
         if surfaces == self.surfaces {
             return;
@@ -339,6 +348,7 @@ impl Screen {
 
     pub fn drop_window_snow(&mut self) {
         self.simulation.update_windows(&[], 0.1, &HashSet::new(), &HashSet::new(), false);
+        self.simulation.covers.clear();
         self.surfaces.clear();
         self.windows_seen = 0;
     }
@@ -389,10 +399,15 @@ impl Screen {
     /// tooltips and the shell's flyouts, as menus stay in front of the snow on a Mac.
     /// Behind windows, the snow is kept just under the desktop icons instead, and above live wallpapers
     /// like Lively's, which go into the same layer and land on top when they start later.
+    /// Behind the taskbar, it is kept just under the display's taskbar, whose icons stay in front of the drift.
     pub fn raise(&self) {
-        let above = match self.layer {
-            Some(layer) => layer.icons.unwrap_or(HWND_TOP),
-            None => lowest_open_popup().unwrap_or(HWND_TOPMOST),
+        // A taskbar out of the topmost band, as under a full-screen app, would take the snow down with it.
+        let topmost = |window: &HWND| unsafe { GetWindowLongPtrW(*window, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
+        let taskbar = if self.behind_taskbar { taskbar(&self.monitor.bounds).filter(topmost) } else { None };
+        let above = match (self.layer, taskbar) {
+            (Some(layer), _) => layer.icons.unwrap_or(HWND_TOP),
+            (None, Some(taskbar)) => taskbar,
+            (None, None) => lowest_open_popup().unwrap_or(HWND_TOPMOST),
         };
         unsafe {
             let _ = SetWindowPos(self.overlay.0, Some(above), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
@@ -401,7 +416,10 @@ impl Screen {
 
     /// Whether this display's taskbar, hiding itself where the snow lies, has come over the overlay, as it does when clicked.
     pub fn under_taskbar(&self) -> bool {
-        self.layer.is_none() && self.monitor.rect == self.monitor.bounds && taskbar_above(self.overlay.0, &self.monitor.bounds)
+        self.layer.is_none()
+            && !self.behind_taskbar
+            && self.monitor.rect == self.monitor.bounds
+            && taskbar_above(self.overlay.0, &self.monitor.bounds)
     }
 
     /// An overlay inside Explorer's wallpaper layer goes away with it when Explorer restarts.

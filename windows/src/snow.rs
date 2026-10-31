@@ -17,7 +17,8 @@ use snowhush_core::geometry::V2;
 use snowhush_core::simulation::{ScatterPiece, SnowSimulation, Snowfall};
 
 use crate::desktop::{self, DesktopLayer};
-use crate::light::{Wallpapers, daylight};
+use crate::halloween::season;
+use crate::light::{Sky, Wallpapers};
 use crate::log;
 use crate::prefs::Settings;
 use crate::render::Gpu;
@@ -38,6 +39,7 @@ pub enum Command {
     Melt(bool),
     SnowOnWindows(bool),
     BehindWindows(bool),
+    BehindTaskbar(bool),
     /// Explorer started again, taking the desktop's wallpaper layer with it.
     ShellRestarted,
     ShowInScreenshots(bool),
@@ -48,6 +50,8 @@ pub enum Command {
     ReleaseSnowfall,
     /// Blows all the snow away; when calm, for less motion, melts it where it lies instead.
     ClearSnow(bool),
+    /// Whether Halloween is wanted when it comes.
+    Halloween(bool),
     Quit,
 }
 
@@ -84,7 +88,8 @@ fn run_loop(commands: &Receiver<Command>, links: &Links, mut settings: Settings)
     let started = Clock::now();
     let mut active = true;
     let mut budget = PowerBudget::Full;
-    let mut light = daylight();
+    let mut halloween = settings.halloween && season();
+    let mut sky = Sky::now(halloween);
     let wallpapers = Wallpapers::new().inspect_err(|error| log!("wallpapers unavailable: {error}")).ok();
     let mut chores_at = 0;
     let mut light_at = 0;
@@ -125,6 +130,10 @@ fn run_loop(commands: &Receiver<Command>, links: &Links, mut settings: Settings)
                     layer = on.then(find_layer).flatten();
                     screens = sync_screens(&gpu, &settings, screens, layer, true);
                 }
+                Command::BehindTaskbar(on) => {
+                    settings.behind_taskbar = on;
+                    screens = sync_screens(&gpu, &settings, screens, layer, true);
+                }
                 Command::ShellRestarted => {
                     if settings.behind_windows {
                         layer = find_layer();
@@ -152,6 +161,11 @@ fn run_loop(commands: &Receiver<Command>, links: &Links, mut settings: Settings)
                 Command::ClearSnow(calm) => {
                     let direction = screens.first().map_or(-1.0, |screen| screen.simulation.breeze_direction());
                     screens.iter_mut().for_each(|screen| screen.simulation.blow_away(direction, calm));
+                }
+                Command::Halloween(on) => {
+                    settings.halloween = on;
+                    chores_at = 0;
+                    light_at = 0;
                 }
                 Command::Active(on) => {
                     if on && !active {
@@ -195,7 +209,7 @@ fn run_loop(commands: &Receiver<Command>, links: &Links, mut settings: Settings)
             chores_at = now + clock.frequency;
             clock.refresh();
             // In case a display change went unannounced.
-            let current = monitors();
+            let current = monitors(settings.behind_taskbar);
             if current.len() != screens.len() || screens.iter().any(|screen| !current.contains(&screen.monitor)) {
                 DISPLAYS_CHANGED.set(true);
             }
@@ -226,7 +240,13 @@ fn run_loop(commands: &Receiver<Command>, links: &Links, mut settings: Settings)
             }
             if now >= light_at {
                 light_at = now + clock.frequency * 60;
-                light = daylight();
+                let on = settings.halloween && season();
+                if on != halloween {
+                    halloween = on;
+                    log!("halloween: {on}");
+                    screens.iter_mut().for_each(|screen| screen.simulation.set_halloween(on));
+                }
+                sky = Sky::now(halloween);
                 if let Some(wallpapers) = &wallpapers {
                     screens.iter_mut().for_each(|screen| screen.update_backdrop(wallpapers));
                 }
@@ -256,7 +276,7 @@ fn run_loop(commands: &Receiver<Command>, links: &Links, mut settings: Settings)
                     continue;
                 }
                 let began = Clock::now();
-                match screen.frame(&gpu, &clock, now, budget, light, time, windows) {
+                match screen.frame(&gpu, &clock, now, budget, sky, time, windows) {
                     Ok(drew) => {
                         stats.frame(drew, Clock::now() - began, screen.simulation.sprite_count());
                         released |= screen.simulation.take_snowfall_released();
@@ -301,7 +321,7 @@ fn run_loop(commands: &Receiver<Command>, links: &Links, mut settings: Settings)
 /// moves behind windows or back.
 fn sync_screens(gpu: &Gpu, settings: &Settings, mut current: Vec<Screen>, layer: Option<DesktopLayer>, rebuild: bool) -> Vec<Screen> {
     let mut result = Vec::new();
-    let displays = monitors();
+    let displays = monitors(settings.behind_taskbar);
     for monitor in displays.iter().cloned() {
         let kept = current.iter().position(|screen| screen.monitor.name == monitor.name);
         let simulation = match kept.map(|i| current.swap_remove(i)) {
@@ -318,13 +338,13 @@ fn sync_screens(gpu: &Gpu, settings: &Settings, mut current: Vec<Screen>, layer:
             None => new_simulation(&monitor, settings),
         };
         log!("display {}: {:?}, {} dpi, {} Hz", monitor.name, monitor.rect, monitor.dpi, monitor.refresh);
-        let screen = Screen::new(gpu, monitor.clone(), simulation, settings.show_in_screenshots, layer).or_else(|(error, simulation)| {
+        let screen = Screen::new(gpu, monitor.clone(), simulation, settings, layer).or_else(|(error, simulation)| {
             // Snow that can't go behind windows stays on top of them rather than vanishing.
             if layer.is_none() {
                 return Err((error, simulation));
             }
             log!("overlay behind windows failed: {error}");
-            Screen::new(gpu, monitor, simulation, settings.show_in_screenshots, None)
+            Screen::new(gpu, monitor, simulation, settings, None)
         });
         match screen {
             Ok(screen) => result.push(screen),
@@ -349,6 +369,7 @@ fn new_simulation(monitor: &Monitor, settings: &Settings) -> SnowSimulation {
     simulation.thaws = settings.melt;
     simulation.accumulates = settings.accumulate;
     simulation.set_snowfall_held(!settings.welcomed);
+    simulation.set_halloween(settings.halloween && season());
     simulation
 }
 
