@@ -3,7 +3,7 @@
 pkgname=snowhush
 pkgver=0.5.11
 pkgrel=1
-pkgdesc="Snow on your Wayland desktop, in KDE Plasma, Sway or niri: it settles on windows and parts around the cursor"
+pkgdesc="Snow on your Wayland desktop, in KDE Plasma, Hyprland, Sway or niri: it settles on windows and parts around the cursor"
 arch=('x86_64' 'aarch64')
 url="https://github.com/mbezruchko/Snowhush"
 license=('MIT')
