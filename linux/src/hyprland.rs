@@ -47,14 +47,16 @@ struct Monitor {
     disabled: bool,
     #[serde(rename = "activeWorkspace")]
     active_workspace: WorkspaceRef,
-    /// A special workspace shown over the active one; it has no id while none is.
+    /// A special workspace shown over the active one; it has no name while none is.
     #[serde(rename = "specialWorkspace")]
     special_workspace: WorkspaceRef,
 }
 
+/// A workspace, known by its name: special workspaces have no id.
 #[derive(Deserialize)]
 struct WorkspaceRef {
-    id: Option<i64>,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +96,9 @@ struct Decoration {
     rounding: f64,
 }
 
+/// Hyprland's own, for a config that can't be asked.
+const PLAIN: Decoration = Decoration { border: 1.0, rounding: 0.0 };
+
 /// The Hyprland instance the app's Wayland connection goes to, if it is one: the folder with its sockets.
 /// A compositor started inside another passes the outer one's variables on, so the instance has to be the one
 /// serving the very Wayland socket the app uses, which its lock file names after its process id.
@@ -107,7 +112,10 @@ pub fn instance() -> Option<PathBuf> {
 
 pub fn start(shared: Arc<Shared>, folder: PathBuf) -> Result<(), String> {
     let requests = folder.join(".socket.sock");
-    let mut decoration = decoration(&requests)?;
+    let mut decoration = decoration(&requests).unwrap_or_else(|error| {
+        log!("hyprland: {error}; windows taken as Hyprland draws them by default");
+        PLAIN
+    });
     let events = UnixStream::connect(folder.join(".socket2.sock")).map_err(|error| error.to_string())?;
     let (announced, announcements) = mpsc::channel::<String>();
     std::thread::Builder::new()
@@ -200,6 +208,7 @@ fn ask(socket: &Path, decoration: Decoration) -> Result<(Report, HashMap<String,
     let clients: Vec<Client> = request(socket, "j/clients")?;
     let mut report = Report::default();
     let mut showing = Vec::new();
+    let mut specials = Vec::new();
     for monitor in monitors.iter().filter(|monitor| !monitor.disabled) {
         let (width, height) = if monitor.transform % 2 == 1 { (monitor.height, monitor.width) } else { (monitor.width, monitor.height) };
         let (w, h) = (width / monitor.scale.max(0.1), height / monitor.scale.max(0.1));
@@ -215,31 +224,37 @@ fn ask(socket: &Path, decoration: Decoration) -> Result<(Report, HashMap<String,
             aw: w - left - right,
             ah: h - top - bottom,
         });
-        showing.extend(monitor.active_workspace.id);
-        showing.extend(monitor.special_workspace.id);
+        showing.push(monitor.active_workspace.name.as_str());
+        specials.push(monitor.special_workspace.name.as_str());
     }
+    showing.retain(|name| !name.is_empty());
+    specials.retain(|name| !name.is_empty());
 
     let mut places = HashMap::new();
     let mut shown: Vec<&Client> = Vec::new();
     for client in clients.iter().filter(|client| client.mapped && !client.hidden) {
-        if !client.workspace.id.is_some_and(|id| showing.contains(&id)) {
+        let workspace = client.workspace.name.as_str();
+        if !showing.contains(&workspace) && !specials.contains(&workspace) {
             report.elsewhere.push(client.address.clone());
             continue;
         }
         places.insert(client.address.clone(), [client.at[0], client.at[1], client.size[0], client.size[1]]);
         shown.push(client);
     }
-    // Front to back: a full-screen window, the pinned ones, the floating ones by how lately each was focused,
-    // which raises them, then the tiled ones, which never overlap.
+    // Front to back: the special workspace's windows, which show over the rest, a full-screen window, the pinned
+    // ones, the floating ones by how lately each was focused, which raises them, then the tiled ones, which never
+    // overlap.
     let layer = |client: &Client| {
-        if client.fullscreen >= 2 {
+        if specials.contains(&client.workspace.name.as_str()) {
             0
-        } else if client.pinned {
+        } else if client.fullscreen >= 2 {
             1
-        } else if client.floating {
+        } else if client.pinned {
             2
-        } else {
+        } else if client.floating {
             3
+        } else {
+            4
         }
     };
     shown.sort_by_key(|client| (layer(client), client.focus_history));
