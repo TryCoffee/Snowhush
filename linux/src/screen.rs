@@ -14,7 +14,7 @@ use snowhush_core::simulation::{Pace, SnowSimulation, WindowId, WindowSurface};
 
 use crate::light::{self, Backdrop, Shade};
 use crate::log;
-use crate::render::{Ambient, Gpu, Surface};
+use crate::render::{Ambient, Gpu, LANTERN_REACH, Surface};
 use crate::snow::App;
 use crate::source::Report;
 use crate::windows::{self, Area, Shelf};
@@ -57,6 +57,10 @@ pub struct Screen {
     shown_pending: Option<Instant>,
     backdrop: Option<Backdrop>,
     shadow_tint: [f32; 4],
+    /// Where the cursor's candle was last drawn, in overlay coordinates.
+    lantern: V2,
+    /// Whether the last frame drawn showed Halloween's pumpkins.
+    pumpkins_shown: bool,
 }
 
 impl Screen {
@@ -104,6 +108,8 @@ impl Screen {
             shown_pending: None,
             backdrop: None,
             shadow_tint: [0.0; 4],
+            lantern: V2::new(-1e6, -1e6),
+            pumpkins_shown: false,
         }
     }
 
@@ -140,6 +146,7 @@ impl Screen {
         if shelf != self.shelf {
             log!("{}: panel {shelf:?}", self.name);
             self.shelf = shelf;
+            self.simulation.shelf = shelf.map(|shelf| shelf.id);
             self.windows_seen = 0;
         }
         let margins = (
@@ -188,8 +195,15 @@ impl Screen {
         self.last_step = Some(now);
         if let Some((report, generation, moving)) = report {
             self.follow(report, generation, moving, snow_on_windows, now);
+            if let Some(slide) = report.slide {
+                self.simulation.space_slid(slide.velocity(now));
+            }
         }
         let changed = self.simulation.step(dt, self.pointer(cursor));
+        // The candle follows the cursor even over snow that lies still.
+        let lantern = self.local(cursor.0, cursor.1);
+        let lantern_moved = ambient.night > 0.0 && (lantern - self.lantern).length() > 0.5 && (self.lit_by(lantern) || self.lit_by(self.lantern));
+        self.lantern = lantern;
 
         let fastest = if budget == PowerBudget::Full { self.interactive_rate } else { self.interactive_rate.min(60) };
         // 24 only where it divides the display's rate evenly; elsewhere it would judder.
@@ -199,10 +213,14 @@ impl Screen {
             Pace::Lively => fastest.min(60),
             Pace::Interactive => fastest,
         };
+        let rate = if lantern_moved { rate.max(fastest.min(60)) } else { rate };
         self.next_due = now + Duration::from_secs_f64(1.0 / rate as f64);
-        self.idle_frames = if changed { 0 } else { self.idle_frames + 1 };
-        // A still pile only needs a slow refresh for its glints.
-        if !(changed || (self.simulation.has_snow() && self.idle_frames % 2 == 0)) {
+        self.idle_frames = if changed || lantern_moved { 0 } else { self.idle_frames + 1 };
+        // A still pile only needs a slow refresh for its glints, and the pumpkins for their candles' flicker; once
+        // they are gone, until a frame without them is shown.
+        let pumpkins = !self.simulation.pumpkins().is_empty();
+        let slow_refresh = self.simulation.has_snow() || pumpkins || self.pumpkins_shown;
+        if !(changed || lantern_moved || (slow_refresh && self.idle_frames % 2 == 0)) {
             return Ok(false);
         }
         // The compositor hasn't shown the last frame yet: drawing another would only be thrown away.
@@ -222,8 +240,15 @@ impl Screen {
             let r = windows::local_rect(&shelf.rect, &self.area());
             [r.min_x(), r.min_y(), r.max_x(), r.max_y() - shelf.radius]
         });
-        gpu.draw(surface, &self.simulation, Ambient { shadow_tint: self.shadow_tint, ..ambient }, panel, time)?;
+        gpu.draw(surface, &self.simulation, Ambient { shadow_tint: self.shadow_tint, lantern, ..ambient }, panel, time)?;
+        self.pumpkins_shown = pumpkins;
         Ok(true)
+    }
+
+    /// Whether a candle at this point, in overlay coordinates, lights anything on this display.
+    fn lit_by(&self, at: V2) -> bool {
+        let reach = LANTERN_REACH * 3.0;
+        at.x > -reach && at.y > -reach && at.x < self.simulation.width() + reach && at.y < self.simulation.height() + reach
     }
 
     /// The compositor showed the last frame.
@@ -250,11 +275,14 @@ impl Screen {
         }
         self.windows_seen = generation;
         let area = self.area();
-        let surfaces = if snow_on_windows {
-            windows::surfaces(report, &area, self.shelf.as_ref())
-        } else {
-            windows::surfaces(&Report::default(), &area, self.shelf.as_ref())
-        };
+        let listed = if snow_on_windows { report } else { &Report::default() };
+        let mut surfaces = windows::surfaces(listed, &area, self.shelf.as_ref());
+        if report.switching {
+            // Windows that came with the new desktop get their snow back once they have slid in; windows on every
+            // desktop keep theirs throughout.
+            surfaces.retain(|surface| self.surfaces.iter().any(|shown| shown.id == surface.id));
+        }
+        self.simulation.covers = windows::covers(listed, &area);
         if surfaces == self.surfaces {
             return;
         }
@@ -278,6 +306,7 @@ impl Screen {
     pub fn drop_window_snow(&mut self) {
         let surfaces = windows::surfaces(&Report::default(), &self.area(), self.shelf.as_ref());
         self.simulation.update_windows(&surfaces, 0.1, &HashSet::new(), &HashSet::new(), false);
+        self.simulation.covers.clear();
         self.surfaces = surfaces;
         self.windows_seen = 0;
     }

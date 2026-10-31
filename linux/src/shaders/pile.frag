@@ -13,6 +13,12 @@ uniform vec2 origin;
 uniform int heightOffset;
 uniform vec4 light;
 uniform vec4 shadowTint;
+// The colour the snow's surface glows, and how much.
+uniform vec4 rim;
+// The cursor's candle: where it is, how far it reaches and how bright it is.
+uniform vec4 lantern;
+// The pumpkins' candles: where each burns, how far its light reaches and how bright it is.
+uniform vec4 pumpkins[3];
 uniform vec4 occluders[16];
 uniform sampler2D heights;
 // The panel's rectangle, left, bottom, right, top: the snow lying behind it doesn't show.
@@ -21,6 +27,8 @@ uniform vec4 panel;
 in vec2 vLocal;
 
 out vec4 fragment;
+
+const vec3 candle = vec3(1.0, 0.62, 0.26);
 
 float fetch(int i) {
     return texelFetch(heights, ivec2(i % 4096, i / 4096), 0).r;
@@ -38,6 +46,23 @@ float hash(vec2 p) {
     p = fract(p * vec2(123.34, 456.21));
     p += dot(p, p + 45.32);
     return fract(p.x * p.y);
+}
+
+float flicker(float t, float seed) {
+    return 0.86 + 0.08 * sin(t * 11.0 + seed * 2.1) + 0.06 * sin(t * 29.0 + 1.3 + seed * 4.3);
+}
+
+/// How much candlelight reaches a point: the cursor's, and the pumpkins' in the snow.
+float candlelight(vec2 point) {
+    vec2 d = point - lantern.xy;
+    float glow = lantern.w * flicker(time, 0.0) * exp(-dot(d, d) / (lantern.z * lantern.z));
+    for (int k = 0; k < 3; k++) {
+        vec4 pumpkin = pumpkins[k];
+        if (pumpkin.w <= 0.0) continue;
+        vec2 e = point - pumpkin.xy;
+        glow += pumpkin.w * flicker(time, float(k + 1)) * exp(-dot(e, e) / (pumpkin.z * pumpkin.z));
+    }
+    return min(glow, 1.0);
 }
 
 void main() {
@@ -75,5 +100,7 @@ void main() {
     }
 
     color *= light.rgb;
+    color = mix(color, rim.rgb, rim.a * exp(-depth / 2.5));
+    color = mix(color, candle, candlelight(world) * (0.35 + 0.65 * exp(-depth / 14.0)) * 0.55);
     fragment = vec4(color * coverage, coverage);
 }
